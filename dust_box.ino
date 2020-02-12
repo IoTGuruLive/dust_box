@@ -18,14 +18,14 @@ String deviceShortId  = "dddddddddddddddddddddd";
 String deviceKey      = "kkkkkkkkkkkkkkkkkkkkkk";
 IoTGuru iotGuru = IoTGuru(userShortId, deviceShortId, deviceKey);
 
-String nodeShortId    = "nnnnnnnnnnnnnnnnnnnnnn";
-const char* ota_version = "sds011-mqtt-1.0.0";
+String sdsNodeShortId    = "ssssssssssssssssssssss";
+String bmeNodeShortId    = "bbbbbbbbbbbbbbbbbbbbbb";
+const char* ota_version = "sds011-bme680-mqtt-1.0.0";
 
-volatile int PIN_SDS_RX  = 4;
-volatile int PIN_SDS_TX  = 5;
-volatile int PIN_SDA     = 0;
-volatile int PIN_SCL     = 2;
-volatile int PIN_POWER   = 14;
+volatile int PIN_SDA     = 4;
+volatile int PIN_SCL     = 5;
+volatile int PIN_SDS_RX  = 0;
+volatile int PIN_SDS_TX  = 2;
 
 #include "SdsDustSensor.h"
 SdsDustSensor sds(PIN_SDS_RX, PIN_SDS_TX);
@@ -35,12 +35,18 @@ union unionForm {
   unsigned int inInt;
 } sdsDeviceId;
 
-#include <BME280_MOD-1022.h>
-#include <Wire.h>
+#define BME_SCK 14
+#define BME_MOSI 12
+#define BME_MISO 5
+#define BME_CS 4
+
+#include "Adafruit_BME680.h"
+Adafruit_BME680 bme(BME_CS, BME_MOSI, BME_MISO,  BME_SCK);
 
 volatile double temp;
 volatile double humidity;
 volatile double pressure;
+volatile double gas;
 
 void setup() {
     Serial.begin(115200);
@@ -80,6 +86,17 @@ void setup() {
     delay(10);
     Serial.println(sds.queryFirmwareVersion().toString());
     Serial.println(sds.setQueryReportingMode().toString());
+
+    if (bme.begin())
+    {
+        bme.setTemperatureOversampling(BME680_OS_8X);
+        bme.setHumidityOversampling(BME680_OS_2X);
+        bme.setPressureOversampling(BME680_OS_4X);
+        bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
+        bme.setGasHeater(320, 150);
+    } else {
+        Serial.println("Could not find a valid BME680 sensor, check wiring!");
+    }
 }
 
 volatile unsigned long nextWakeup = 0;
@@ -125,7 +142,21 @@ void loop() {
             Serial.print(", PM10 = ");
             Serial.println(pm.pm10);
 
-            if (readBME280() == 1) {
+            if (bme.performReading()) {
+                temp = bme.temperature / 1.0;
+                humidity = bme.humidity / 1.0;
+                pressure = bme.pressure / 100.0;
+                gas = bme.gas_resistance / 1000.0;
+
+                Serial.print("Environmental measurement temperature = ");
+                Serial.print(temp);
+                Serial.print(", humidity = ");
+                Serial.print(humidity);
+                Serial.print(", pressure = ");
+                Serial.print(pressure);
+                Serial.print(", gas = ");
+                Serial.println(gas);
+
                 Serial.println("Compensate the dust measurement with the humidity");
                 pm.pm25 = pm.pm25 / (1.0 + 0.48756 * pow((humidity / 100.0), 8.60068));
                 pm.pm10 = pm.pm10 / (1.0 + 0.81559 * pow((humidity / 100.0), 5.83411));
@@ -135,15 +166,20 @@ void loop() {
                 Serial.print(", PM10 = ");
                 Serial.println(pm.pm10);
 
-                iotGuru.sendMqttValue(nodeShortId, "temperature", temp);
-                iotGuru.sendMqttValue(nodeShortId, "humidity", humidity);
-                iotGuru.sendMqttValue(nodeShortId, "pressure", pressure);
+                iotGuru.sendMqttValue(bmeNodeShortId, "temperature", temp);
+                iotGuru.sendMqttValue(bmeNodeShortId, "humidity", humidity);
+                iotGuru.sendMqttValue(bmeNodeShortId, "pressure", pressure);
+                if (millis() > 900000) {
+                    iotGuru.sendMqttValue(bmeNodeShortId, "gas", gas);
+                } else {
+                    Serial.println("Skipping VOC gas sensor sending after cold boot (15 mins)");
+                }
             } else {
                 Serial.println("Could not read values from BME280 sensor, do not compensate");
             }
 
-            iotGuru.sendMqttValue(nodeShortId, "pm25", pm.pm25);
-            iotGuru.sendMqttValue(nodeShortId, "pm10", pm.pm10);
+            iotGuru.sendMqttValue(sdsNodeShortId, "pm25", pm.pm25);
+            iotGuru.sendMqttValue(sdsNodeShortId, "pm10", pm.pm10);
 
             readAttempt = 0;
         } else {
@@ -155,72 +191,4 @@ void loop() {
 
 void callback(const char* nodeShortId, const char* fieldName, const char* message) {
     Serial.print(nodeShortId);Serial.print(" - ");Serial.print(fieldName);Serial.print(": ");Serial.println(message);
-}
-
-int readBME280() {
-    digitalWrite(PIN_POWER, HIGH);
-    delay(5);
-
-    Wire.begin(PIN_SDA, PIN_SCL);
-    uint8_t chipID = BME280.readChipId();
-
-    Serial.print("ChipID = 0x");
-    Serial.println(chipID, HEX);
-
-    if (chipID != 0x60) {
-        digitalWrite(PIN_POWER, LOW);
-        return -1;
-    }
-
-    BME280.readCompensationParams();
-    BME280.writeOversamplingPressure(os16x);
-    BME280.writeOversamplingTemperature(os16x);
-    BME280.writeOversamplingHumidity(os16x);
-
-    BME280.writeMode(smForced);
-
-    int result = repeatedBMERead();
-
-    BME280.writeMode(smNormal);
-
-    digitalWrite(PIN_POWER, LOW);
-
-    if (result == 0) {
-        Serial.println("Cannot read valid measurements...");
-        return 0;
-    }
-
-    Serial.println("Temperature  " + String(temp));
-    Serial.println("Humidity     " + String(humidity));
-    Serial.println("Pressure     " + String(pressure));
-
-    return 1;
-}
-
-int repeatedBMERead() {
-    for (int i = 0; i < 10; i++) {
-        Serial.println("Measuring...");
-        while (BME280.isMeasuring()) {
-            delay(1);
-        }
-
-        noInterrupts();
-        BME280.readMeasurements();
-        interrupts();
-
-        temp = BME280.getTemperature();
-        humidity = BME280.getHumidity();
-        pressure = BME280.getPressure();
-
-        BME280.writeStandbyTime(tsb_0p5ms);
-        BME280.writeFilterCoefficient(fc_16);
-
-        if (pressure > 800 && pressure < 1200) {
-            return 1;
-        }
-
-        delay(10);
-    }
-
-    return 0;
 }
